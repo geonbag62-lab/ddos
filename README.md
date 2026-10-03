@@ -1,4 +1,4 @@
-# mini_stress_pro
+# ddos.py
 
 > 소규모 네트워크 부하(Load) 테스트 도구 · GUI + CLI
 
