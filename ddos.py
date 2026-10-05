@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DDOS v3.1 (Performance Boosted)
+load-test v3.2 (정밀 페이싱 · 사전 DNS 확인 · 안정성 개선)
 - 소규모 네트워크 부하(스트레스) 테스트 도구 (GUI + CLI)
 - 본인 소유이거나 테스트 허가를 받은 대상에만 사용하세요.
 
 실행 방법:
   python ddos.py                                   -> GUI 모드 (기본)
   python ddos.py --cli -t IP -p PORT --protocol udp --size 4000 --time 30 --rate 200 -> 명령줄 모드
+  python ddos.py --cli -t IP -p PORT --protocol udp --rate 4000 --threads 4 --processes 2
+                                                   -> 멀티프로세스 모드 (고pps 구간)
+
+v3.1 -> v3.2 주요 변경점:
+ 1) Windows 타이머 해상도 15.6ms -> 1ms (timeBeginPeriod): 기존에는 time.sleep(2ms)가
+    실제로는 ~15.6ms씩 걸려 실제 전송률이 목표의 수 % 수준으로 떨어지던 핵심 원인 수정
+ 2) 하이브리드 페이서(sleep+spin) + 20ms 배치 윈도우: pps 정확도 대폭 개선
+ 3) 대상 주소 1회 사전 확인(DNS): 도메인 입력 시 매 패킷마다 DNS 조회되던
+    치명적 성능 문제 수정
+ 4) HTTP: 크기 7KB 초과 시 헤더 대신 POST 본문 사용(서버의 대형 헤더 4xx 거절 방지),
+    요청 파이프라이닝으로 처리량 향상
+ 5) TCP/HTTP: 응답 수신(drain) 추가 - 수신 버퍼 정체/연결 리셋 방지, EOF 감지 시 재접속
+ 6) UDP: 송신 버퍼 포화(WSAEWOULDBLOCK/WSAENOBUFS) 시 백오프
+ 7) CLI --processes 옵션(1~8): 멀티프로세스로 GIL 우회, 고pps 구간 확장
+ 8) 재접속 백오프 지터, SO_RCVBUF 확대, tkinter 임포트 가드 등 안정성 보강
 """
 
 import argparse
+import errno
 import math
 import os
 import random
@@ -18,13 +34,15 @@ import socket
 import sys
 import threading
 import time
-import tkinter.font as tkfont
+import multiprocessing as mp
 
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import messagebox
-except ImportError:
+except ImportError:  # GUI 미사용 환경(CLI 전용)
     tk = None
+    tkfont = None
 
 # ─────────────────────────────────────────────────────────────
 # 공통 엔진
@@ -33,191 +51,234 @@ stop_event = threading.Event()
 stats_lock = threading.Lock()
 stats = {"packets": 0, "bytes": 0, "errors": 0, "reconnects": 0}
 
+MP_SINK = None  # 멀티프로세스 모드에서 부모가 읽는 공유 카운터
+MP_STOP = None  # 멀티프로세스 모드 정지 이벤트
+
+PACING_WINDOW = 0.02    # 페이싱 배치 윈도우(초). 20ms마다 한 배치 전송
+PIPELINE_CAP = 262144   # 한 번에 합쳐 보낼 최대 바이트
+
+_SOFT = set()
+for _name in ("EWOULDBLOCK", "EAGAIN", "ENOBUFS", "EINTR", "EINPROGRESS"):
+    _v = getattr(errno, _name, None)
+    if _v is not None:
+        _SOFT.add(_v)
+SOFT_ERRNOS = frozenset(_SOFT | {10035, 10055})  # WSAEWOULDBLOCK, WSAENOBUFS
+
+
+class _GlobalSink:
+    __slots__ = ()
+
+    def add(self, p, b, e, r):
+        with stats_lock:
+            stats["packets"] += p
+            stats["bytes"] += b
+            stats["errors"] += e
+            stats["reconnects"] += r
+
+
+class _SharedSink:
+    """멀티프로세스 모드: 자식 프로세스의 카운터를 공유 메모리에 반영."""
+    __slots__ = ("c", "lock")
+
+    def __init__(self, counters, lock):
+        self.c = counters
+        self.lock = lock
+
+    def add(self, p, b, e, r):
+        with self.lock:
+            c = self.c
+            if p:
+                c[0].value += p
+            if b:
+                c[1].value += b
+            if e:
+                c[2].value += e
+            if r:
+                c[3].value += r
+
+
+GLOBAL_SINK = _GlobalSink()
+
+
 def reset_stats():
     with stats_lock:
-        stats["packets"] = 0
-        stats["bytes"] = 0
-        stats["errors"] = 0
-        stats["reconnects"] = 0
+        for k in stats:
+            stats[k] = 0
+
 
 def snapshot():
     with stats_lock:
-        return dict(stats)
+        out = dict(stats)
+    if MP_SINK is not None:
+        with MP_SINK.lock:
+            c = MP_SINK.c
+            out["packets"] += c[0].value
+            out["bytes"] += c[1].value
+            out["errors"] += c[2].value
+            out["reconnects"] += c[3].value
+    return out
 
-def _bump(p, b, e, r=0):
-    with stats_lock:
-        stats["packets"] += p
-        stats["bytes"] += b
-        stats["errors"] += e
-        stats["reconnects"] += r
 
-def _flush(state, last_flush, final=False):
-    """로컬 카운터를 공유 통계에 반영 (0.5초 간격 or 종료 시)."""
+def _flush(state, last_flush, sink, final=False):
+    """로컬 카운터를 sink에 반영 (0.5초 간격 or 종료 시)."""
     now = time.perf_counter()
     if final or now - last_flush[0] >= 0.5:
         p, b, e, r = state
         if p or b or e or r:
-            _bump(p, b, e, r)
+            sink.add(p, b, e, r)
             state[0] = state[1] = state[2] = state[3] = 0
         last_flush[0] = now
 
-def udp_worker(target, port, payload, rate_per_thread):
+
+class Pacer:
+    """하이브리드 정밀 페이서.
+
+    - 20ms 배치 윈도우로 묶어 한 번에 batch개 전송
+    - 대기가 3ms 이상이면 sleep, 나머지 미세 구간은 spin으로 마감
+      (Windows 기본 sleep 최소 단위 ~15.6ms 문제 회피)
+    """
+
+    __slots__ = ("rate", "batch", "interval", "next")
+
+    def __init__(self, rate_per_thread):
+        self.rate = float(rate_per_thread)
+        if self.rate > 0:
+            self.batch = max(1, int(round(self.rate * PACING_WINDOW)))
+            self.interval = self.batch / self.rate
+        else:
+            self.batch = 50   # 무제한 모드: 반복당 50개
+            self.interval = 0.0
+        self.next = time.perf_counter()
+
+    def wait_slot(self):
+        if self.interval <= 0:
+            return
+        now = time.perf_counter()
+        delay = self.next - now
+        if delay > 0.003:
+            time.sleep(delay - 0.002)
+        if time.perf_counter() < self.next:
+            while time.perf_counter() < self.next:
+                time.sleep(0)
+        now = time.perf_counter()
+        if now - self.next >= self.interval * 2:
+            # 한 슬롯 이상 늦어졌으면 재동기화 (버스트 급증 방지)
+            self.next = now
+        else:
+            self.next += self.interval
+
+
+def _drain_nb(sock, rounds=4):
+    """소켓 수신 버퍼 비우기(논블로킹). 서버가 닫았으면(EOF) False 반환."""
+    ok = True
+    try:
+        sock.setblocking(False)
+        for _ in range(rounds):
+            try:
+                data = sock.recv(65536)
+                if not data:
+                    ok = False
+                    break
+            except BlockingIOError:
+                break
+            except OSError:
+                ok = False
+                break
+    except OSError:
+        ok = False
+    finally:
+        try:
+            sock.setblocking(True)
+        except OSError:
+            pass
+    return ok
+
+
+def _connect(ip, port):
+    sock = socket.create_connection((ip, port), timeout=3)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+    except OSError:
+        pass
+    return sock
+
+
+def _jitter():
+    """재접속 백오프 지터 0.1~0.3초."""
+    return 0.1 + random.random() * 0.2
+
+
+def udp_worker(ip, port, payload, rate_per_thread, stop_ev=None, sink=None):
+    sink = sink or GLOBAL_SINK
+    stop = stop_ev if stop_ev is not None else stop_event
+    pacer = Pacer(rate_per_thread)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
     except OSError:
         pass
-
-    state = [0, 0, 0, 0]  # packets, bytes, errors, reconnects
-    last_flush = [time.perf_counter()]
+    addr = (ip, port)
+    send = sock.sendto
     payload_len = len(payload)
+    state = [0, 0, 0, 0]
+    last_flush = [time.perf_counter()]
 
-    # 배치 단위 계산 (OS time.sleep 한계 극복)
-    if rate_per_thread > 0:
-        batch_size = max(1, int(rate_per_thread * 0.002))
-        batch_interval = batch_size / rate_per_thread
-    else:
-        batch_size = 50
-        batch_interval = 0
-
-    next_send = time.perf_counter()
-
-    while not stop_event.is_set():
-        p_cnt = 0
-        e_cnt = 0
-        for _ in range(batch_size):
+    while not stop.is_set():
+        batch = pacer.batch
+        p_cnt = e_cnt = 0
+        for _ in range(batch):
             try:
-                sock.sendto(payload, (target, port))
+                send(payload, addr)
                 p_cnt += 1
-            except OSError:
+            except OSError as ex:
                 e_cnt += 1
+                if ex.errno in SOFT_ERRNOS:
+                    # 송신 버퍼 포화 등: 잠깐 숨 돌리고 계속
+                    time.sleep(0.001)
 
         state[0] += p_cnt
         state[1] += p_cnt * payload_len
         state[2] += e_cnt
-
-        if batch_interval > 0:
-            next_send += batch_interval
-            delay = next_send - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_send = time.perf_counter()
-
-        _flush(state, last_flush)
+        pacer.wait_slot()
+        _flush(state, last_flush, sink)
 
     sock.close()
-    _flush(state, last_flush, final=True)
+    _flush(state, last_flush, sink, final=True)
 
-def tcp_worker(target, port, payload, rate_per_thread):
-    state = [0, 0, 0, 0]
-    last_flush = [time.perf_counter()]
+
+def tcp_worker(ip, port, payload, rate_per_thread, stop_ev=None, sink=None):
+    sink = sink or GLOBAL_SINK
+    stop = stop_ev if stop_ev is not None else stop_event
+    pacer = Pacer(rate_per_thread)
     payload_len = len(payload)
-    sock = None
-
-    if rate_per_thread > 0:
-        batch_size = max(1, int(rate_per_thread * 0.002))
-        batch_interval = batch_size / rate_per_thread
-    else:
-        batch_size = 20
-        batch_interval = 0
-
-    next_send = time.perf_counter()
-
-    while not stop_event.is_set():
-        if sock is None:
-            try:
-                sock = socket.create_connection((target, port), timeout=3)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-                except OSError:
-                    pass
-            except OSError:
-                state[2] += 1
-                time.sleep(0.2)
-                continue
-
-        p_cnt = 0
-        e_cnt = 0
-        for _ in range(batch_size):
-            try:
-                sock.sendall(payload)
-                p_cnt += 1
-            except OSError:
-                e_cnt += 1
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-                sock = None
-                state[3] += 1
-                break
-
-        state[0] += p_cnt
-        state[1] += p_cnt * payload_len
-        state[2] += e_cnt
-
-        if batch_interval > 0:
-            next_send += batch_interval
-            delay = next_send - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_send = time.perf_counter()
-
-        _flush(state, last_flush)
-
-    if sock is not None:
-        try:
-            sock.close()
-        except OSError:
-            pass
-    _flush(state, last_flush, final=True)
-
-def http_worker(target, port, size, rate_per_thread):
-    pad = "X" * max(0, size)
-    # HTTP 패킷 사전 구축 (루프 내 인코딩 오버헤드 제거)
-    req_template = (
-        f"GET / HTTP/1.1\r\n"
-        f"Host: {target}\r\n"
-        f"User-Agent: load-test\r\n"
-        f"X-Pad: {pad}\r\n"
-        f"Connection: keep-alive\r\n\r\n"
-    ).encode("utf-8", "ignore")
-    req_len = len(req_template)
-
+    merged = max(1, min(pacer.batch if pacer.batch else 20, PIPELINE_CAP // max(1, payload_len)))
+    payload_big = payload * merged if merged > 1 else payload
     state = [0, 0, 0, 0]
     last_flush = [time.perf_counter()]
     sock = None
 
-    if rate_per_thread > 0:
-        batch_size = max(1, int(rate_per_thread * 0.002))
-        batch_interval = batch_size / rate_per_thread
-    else:
-        batch_size = 20
-        batch_interval = 0
-
-    next_send = time.perf_counter()
-
-    while not stop_event.is_set():
+    while not stop.is_set():
         if sock is None:
             try:
-                sock = socket.create_connection((target, port), timeout=3)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock = _connect(ip, port)
             except OSError:
                 state[2] += 1
-                time.sleep(0.2)
+                time.sleep(_jitter())
                 continue
 
-        p_cnt = 0
-        e_cnt = 0
-        for _ in range(batch_size):
+        sent = 0
+        while sent < pacer.batch and not stop.is_set():
+            n = min(merged, pacer.batch - sent)
+            buf = payload_big if n == merged else payload * n
             try:
-                sock.sendall(req_template)
-                p_cnt += 1
+                sock.sendall(buf)
+                sent += n
             except OSError:
-                e_cnt += 1
                 try:
                     sock.close()
                 except OSError:
@@ -226,28 +287,219 @@ def http_worker(target, port, size, rate_per_thread):
                 state[3] += 1
                 break
 
-        state[0] += p_cnt
-        state[1] += p_cnt * req_len
-        state[2] += e_cnt
-
-        if batch_interval > 0:
-            next_send += batch_interval
-            delay = next_send - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_send = time.perf_counter()
-
-        _flush(state, last_flush)
+        state[0] += sent
+        state[1] += sent * payload_len
+        if sock is not None:
+            # 응답을 읽어 수신 버퍼/서버 송신 윈도우가 막히지 않게 한다
+            if not _drain_nb(sock):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                state[3] += 1
+        pacer.wait_slot()
+        _flush(state, last_flush, sink)
 
     if sock is not None:
         try:
             sock.close()
         except OSError:
             pass
-    _flush(state, last_flush, final=True)
+    _flush(state, last_flush, sink, final=True)
 
-WORKERS = {"udp": udp_worker, "tcp": tcp_worker, "http": http_worker}
+
+def http_worker(ip, port, size, rate_per_thread, stop_ev=None, sink=None, host=None):
+    sink = sink or GLOBAL_SINK
+    stop = stop_ev if stop_ev is not None else stop_event
+    host = host or ip  # Host 헤더는 원래 입력값(가상호스트) 사용, 접속은 IP로
+    ts = int(time.time())
+
+    if size <= 7000:
+        # 크기가 작으면 기존처럼 X-Pad 헤더로 패딩 (전체 요청 길이 ≈ size)
+        head = (
+            f"GET /?_={ts} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: load-test/3.2\r\n"
+            f"Accept: */*\r\n"
+            f"Connection: keep-alive\r\n"
+        )
+        pad_len = max(0, size - len(head) - len("X-Pad: ") - 4)
+        req = (head + "X-Pad: " + "X" * pad_len + "\r\n\r\n").encode("utf-8", "ignore")
+    else:
+        # 크기가 크면 헤더가 서버 한도(보통 8KB)를 넘어 400 거절되므로 본문으로 전달
+        body = "X" * size
+        req = (
+            f"POST /?_={ts} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: load-test/3.2\r\n"
+            f"Accept: */*\r\n"
+            f"Content-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: {size}\r\n"
+            f"Connection: keep-alive\r\n\r\n{body}"
+        ).encode("utf-8", "ignore")
+
+    req_len = len(req)
+    pipeline = max(1, min(8, PIPELINE_CAP // max(1, req_len)))
+    req_big = req * pipeline if pipeline > 1 else req
+    pacer = Pacer(rate_per_thread)
+    state = [0, 0, 0, 0]
+    last_flush = [time.perf_counter()]
+    sock = None
+
+    while not stop.is_set():
+        if sock is None:
+            try:
+                sock = _connect(ip, port)
+            except OSError:
+                state[2] += 1
+                time.sleep(_jitter())
+                continue
+
+        sent = 0
+        while sent < pacer.batch and not stop.is_set():
+            n = min(pipeline, pacer.batch - sent)
+            buf = req_big if n == pipeline else req * n
+            try:
+                sock.sendall(buf)
+                sent += n
+            except OSError:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                state[3] += 1
+                break
+
+        state[0] += sent
+        state[1] += sent * req_len
+        if sock is not None and not _drain_nb(sock):
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sock = None
+            state[3] += 1
+        pacer.wait_slot()
+        _flush(state, last_flush, sink)
+
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    _flush(state, last_flush, sink, final=True)
+
+
+def resolve_target(target):
+    """대상 주소를 시작 시 1회만 확인한다.
+
+    (소켓 API에 도메인 문자열을 그대로 넘기면 sendto/connect 때마다
+     getaddrinfo DNS 조회가 발생해 속도가 크게 떨어짐)
+    """
+    t = str(target).strip()
+    try:
+        infos = socket.getaddrinfo(t, None, socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            return infos[0][4][0]
+    except OSError:
+        pass
+    return t
+
+
+_timer_boosted = False
+
+
+def boost_timer_resolution():
+    """Windows 타이머 해상도를 1ms로 올린다 (sleep 정밀도 개선)."""
+    global _timer_boosted
+    if os.name == "nt" and not _timer_boosted:
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            _timer_boosted = True
+        except Exception:
+            pass
+
+
+def restore_timer_resolution():
+    global _timer_boosted
+    if os.name == "nt" and _timer_boosted:
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+
+
+def stop_all():
+    """스레드/프로세스 워커를 모두 정지시킨다."""
+    stop_event.set()
+    if MP_STOP is not None:
+        MP_STOP.set()
+
+
+def _make_thread(protocol, ip, port, payload, size, rpt, stop_ev, sink, host):
+    if protocol == "udp":
+        return threading.Thread(target=udp_worker, args=(ip, port, payload, rpt, stop_ev, sink), daemon=True)
+    if protocol == "tcp":
+        return threading.Thread(target=tcp_worker, args=(ip, port, payload, rpt, stop_ev, sink), daemon=True)
+    return threading.Thread(target=http_worker, args=(ip, port, size, rpt, stop_ev, sink, host), daemon=True)
+
+
+def spawn_workers(target, port, protocol, size, rate, threads, processes=1, resolved_ip=None):
+    """워커 시작. 스레드(또는 프로세스) 객체 리스트를 반환.
+
+    processes > 1 이면 멀티프로세스 모드: 자식 프로세스마다 threads개 스레드 실행,
+    카운터는 공유 메모리(mp.Value)로 집계된다.
+    """
+    global MP_SINK, MP_STOP
+    stop_event.clear()
+    MP_SINK = None
+    MP_STOP = None
+    ip = resolved_ip or resolve_target(target)
+    processes = max(1, int(processes))
+    threads = max(1, int(threads))
+    total = processes * threads
+    rate_per_thread = rate / total if rate > 0 else 0.0
+    payload = os.urandom(size) if protocol in ("udp", "tcp") else None
+
+    if processes == 1:
+        result = []
+        for _ in range(threads):
+            t = _make_thread(protocol, ip, port, payload, size, rate_per_thread, None, None, target)
+            t.start()
+            result.append(t)
+        return result
+
+    MP_STOP = mp.Event()
+    counters = [mp.Value("Q", 0, lock=False) for _ in range(4)]
+    lock = mp.Lock()
+    MP_SINK = _SharedSink(counters, lock)
+    procs = []
+    for _ in range(processes):
+        p = mp.Process(
+            target=_proc_main,
+            args=(ip, port, protocol, payload, size, rate_per_thread, threads, MP_STOP, counters, lock, target),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+    return procs
+
+
+def _proc_main(ip, port, protocol, payload, size, rate_per_thread, threads, stop_ev, counters, lock, host):
+    """멀티프로세스 모드 자식 진입점 (Windows spawn 안전: 모듈 레벨 함수)."""
+    sink = _SharedSink(counters, lock)
+    ts = []
+    for _ in range(threads):
+        t = _make_thread(protocol, ip, port, payload, size, rate_per_thread, stop_ev, sink, host)
+        t.start()
+        ts.append(t)
+    for t in ts:
+        t.join()
+
 
 def validate_cfg(target, port, protocol, size, duration, rate, threads, force=False):
     """설정 검사 (CLI용). 문제가 없으면 None, 있으면 오류 메시지를 반환."""
@@ -282,27 +534,10 @@ def validate_cfg(target, port, protocol, size, duration, rate, threads, force=Fa
 
     return None
 
-def spawn_workers(target, port, protocol, size, rate, threads):
-    """워커 스레드 시작. 스레드 리스트를 반환."""
-    stop_event.clear()
-    rate_per_thread = rate / max(1, threads) if rate > 0 else 0.0
-
-    if protocol == "http":
-        worker_fn = lambda i: WORKERS[protocol](target, port, size, rate_per_thread)
-    else:
-        payload = os.urandom(size)
-        worker_fn = lambda i: WORKERS[protocol](target, port, payload, rate_per_thread)
-
-    result = []
-    for i in range(threads):
-        t = threading.Thread(target=worker_fn, args=(i,), daemon=True)
-        t.start()
-        result.append(t)
-    return result
 
 def auto_threads(rate):
     """강도에 맞춘 적정 동시 작업 수."""
-    return max(2, min(32, round(rate / 250)))
+    return max(2, min(64, round(rate / 250)))
 
 # ─────────────────────────────────────────────────────────────
 # 색상 팔레트 — GitHub 다크
@@ -617,7 +852,7 @@ class StressGUI:
 
         ver = tk.Frame(head, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         ver.pack(side="left", padx=(8, 0))
-        self._label(ver, " v3.1 ", color=C_ACCENT, size=8, bold=True, mono=True).pack(padx=5, pady=1)
+        self._label(ver, " v3.2 ", color=C_ACCENT, size=8, bold=True, mono=True).pack(padx=5, pady=1)
 
         self.status_pill = StatusPill(head)
         self.status_pill.pack(side="right")
@@ -946,12 +1181,14 @@ class StressGUI:
         threads = auto_threads(rate)
         mname = next(n for k, n, _ in METHODS if k == protocol)
 
+        ip = resolve_target(target)
+
         reset_stats()
         self.last_p = self.last_b = 0
         self.last_log = time.perf_counter()
         self.start_time = time.perf_counter()
         self.stopping = False
-        self.workers = spawn_workers(target, port, protocol, size, rate, threads)
+        self.workers = spawn_workers(target, port, protocol, size, rate, threads, processes=1, resolved_ip=ip)
         self.running = True
 
         est_mb = rate * size * self.duration / 1024 / 1024
@@ -961,13 +1198,14 @@ class StressGUI:
         self._set_foot("running", C_GREEN)
         self._log(f"▶ {target}:{port} · {mname} · {self.duration:.0f}초 · " f"초당 {rate}번 · 크기 {size}", "accent")
         self._log(f"  총 {threads}개 작업이 돌아가요 · 예상 전송량 약 {est_mb:.1f} MB", "info")
+        self._log(f"  확인된 주소(IP): {ip}", "info")
 
         self._anim_loop()
         self.root.after(200, self._poll)
 
     def stop(self):
         if self.running and not self.stopping:
-            stop_event.set()
+            stop_all()
             self.stopping = True
             self.status_pill.set(C_AMBER, "멈추는 중", pulse=False)
             self._set_foot("stopping", C_AMBER)
@@ -1040,7 +1278,7 @@ class StressGUI:
         self._set_foot("done", C_ACCENT)
 
     def _on_close(self):
-        stop_event.set()
+        stop_all()
         self.root.destroy()
 
 def gui_main():
@@ -1052,6 +1290,7 @@ def gui_main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    boost_timer_resolution()
     root = tk.Tk()
     StressGUI(root)
     root.mainloop()
@@ -1072,42 +1311,55 @@ def cli_main():
     ap.add_argument("--protocol", choices=["udp", "tcp", "http"], default="udp", help="프로토콜 (기본: udp)")
     ap.add_argument("--size", type=int, default=4000, help="패킷 크기 bytes (기본: 4000)")
     ap.add_argument("--time", type=float, default=10.0, help="지속 시간 초 (기본: 10)")
-    ap.add_argument("--rate", type=float, default=100.0, help="초당 패킷 수, 전체 스레드 합계 (기본: 100)")
+    ap.add_argument("--rate", type=float, default=100.0, help="초당 패킷 수, 전체 합계 (기본: 100)")
     ap.add_argument("--threads", type=int, default=2, help="동시 스레드 수 (기본: 2)")
+    ap.add_argument("--processes", type=int, default=1, help="프로세스 수 1~8 (기본: 1. 2 이상이면 멀티프로세스로 GIL 우회)")
     ap.add_argument("--force", action="store_true", help="브로드캐스트/네트워크 주소 검사 건너뜀")
     args = ap.parse_args()
+
+    if not (1 <= args.processes <= 8):
+        print("오류: --processes는 1~8 범위로 입력하세요")
+        sys.exit(1)
 
     err = validate_cfg(args.target, args.port, args.protocol, args.size, args.time, args.rate, args.threads, force=args.force)
     if err:
         print(f"오류: {err}")
         sys.exit(1)
 
+    ip = resolve_target(args.target)
+    shown = args.target if ip == args.target.strip() else f"{args.target} (→ {ip})"
+
     print(
-        f"대상: {args.target}:{args.port} | 프로토콜: {args.protocol.upper()} | "
+        f"대상: {shown}:{args.port} | 프로토콜: {args.protocol.upper()} | "
         f"크기: {args.size}B | 시간: {args.time:.0f}초 | 속도: {args.rate:.0f}pps | "
-        f"스레드: {args.threads}"
+        f"스레드: {args.threads} × 프로세스 {args.processes}"
     )
     print("중지: Ctrl+C\n")
 
+    boost_timer_resolution()
     start = time.perf_counter()
     reset_stats()
-    threads = spawn_workers(args.target, args.port, args.protocol, args.size, args.rate, args.threads)
+    workers = spawn_workers(args.target, args.port, args.protocol, args.size, args.rate, args.threads, processes=args.processes, resolved_ip=ip)
     last_p = last_b = 0
-
-    while time.perf_counter() - start < args.time:
-        time.sleep(1.0)
-        snap = snapshot()
-        now_time = time.perf_counter() - start
-        print(
-            f"[{now_time:6.1f}초] 누적 {snap['packets']:>8} 패킷 | "
-            f"{(snap['packets'] - last_p):>5} pps | "
-            f"{(snap['bytes'] - last_b) / 1024:>9.1f} KB/s | 오류 {snap['errors']}"
-        )
-        last_p, last_b = snap["packets"], snap["bytes"]
-
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=5)
+    try:
+        while time.perf_counter() - start < args.time:
+            time.sleep(1.0)
+            snap = snapshot()
+            now_time = time.perf_counter() - start
+            print(
+                f"[{now_time:6.1f}초] 누적 {snap['packets']:>8} 패킷 | "
+                f"{(snap['packets'] - last_p):>5} pps | "
+                f"{(snap['bytes'] - last_b) / 1024:>9.1f} KB/s | "
+                f"오류 {snap['errors']} / 재접속 {snap['reconnects']}"
+            )
+            last_p, last_b = snap["packets"], snap["bytes"]
+    except KeyboardInterrupt:
+        print("\n사용자 중지 요청")
+    finally:
+        stop_all()
+        for w in workers:
+            w.join(timeout=5)
+        restore_timer_resolution()
 
     snap = snapshot()
     elapsed = time.perf_counter() - start
